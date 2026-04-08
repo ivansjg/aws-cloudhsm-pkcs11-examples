@@ -10,6 +10,7 @@ add_executable(aes_zero_padding_wrapping aes_zero_padding_wrapping.c aes_wrappin
 add_executable(aes_wrapping aes_wrapping.c aes_wrapping_common.c)
 add_executable(rsa_wrapping rsa_wrapping.c)
 add_executable(rsa_aes_ec_import_sign rsa_aes_ec_import_sign.c)
+add_executable(rsa_oaep_aes_gcm_ec_import_sign rsa_oaep_aes_gcm_ec_import_sign.c)
 add_executable(wrap_with_template wrap_with_template.c)
 add_executable(unwrap_with_template unwrap_with_template.c)
 
@@ -23,6 +24,11 @@ target_link_libraries(rsa_aes_ec_import_sign cloudhsmpkcs11 ${OPENSSL_LIBRARIES}
 if (NOT MSVC)
   target_compile_options(rsa_aes_ec_import_sign PRIVATE -Wno-deprecated-declarations)
 endif()
+target_include_directories(rsa_oaep_aes_gcm_ec_import_sign PRIVATE ${OPENSSL_INCLUDE_DIR})
+target_link_libraries(rsa_oaep_aes_gcm_ec_import_sign cloudhsmpkcs11 ${OPENSSL_LIBRARIES})
+if (NOT MSVC)
+  target_compile_options(rsa_oaep_aes_gcm_ec_import_sign PRIVATE -Wno-deprecated-declarations)
+endif()
 target_link_libraries(wrap_with_template cloudhsmpkcs11)
 target_link_libraries(unwrap_with_template cloudhsmpkcs11)
 
@@ -32,5 +38,6 @@ add_test(aes_zero_padding_wrapping aes_zero_padding_wrapping --pin ${HSM_USER}:$
 add_test(aes_wrapping aes_wrapping --pin ${HSM_USER}:${HSM_PASSWORD})
 add_test(rsa_wrapping rsa_wrapping --pin ${HSM_USER}:${HSM_PASSWORD}) 
 add_test(rsa_aes_ec_import_sign rsa_aes_ec_import_sign --pin ${HSM_USER}:${HSM_PASSWORD})
+add_test(rsa_oaep_aes_gcm_ec_import_sign rsa_oaep_aes_gcm_ec_import_sign --pin ${HSM_USER}:${HSM_PASSWORD})
 add_test(wrap_with_template wrap_with_template --pin ${HSM_USER}:${HSM_PASSWORD})
 add_test(unwrap_with_template unwrap_with_template --pin ${HSM_USER}:${HSM_PASSWORD} --wp_key ${TRUSTED_WRAPPING_KEY_LABEL})

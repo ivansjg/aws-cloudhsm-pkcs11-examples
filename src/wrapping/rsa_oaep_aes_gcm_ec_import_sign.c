@@ -35,6 +35,8 @@
 #define DEFAULT_SIGNATURE_RAW_FILE "imported_ec_signature.bin"
 #define DEFAULT_SIGNATURE_DER_FILE "imported_ec_signature.der"
 #define DEFAULT_AES_KEY_BITS 256
+#define AES_GCM_IV_LEN_BYTES 12
+#define AES_GCM_TAG_LEN_BYTES 16
 #define MAX_SIGNATURE_LENGTH 256
 
 struct imported_ec_material {
@@ -433,76 +435,6 @@ done:
     return rv;
 }
 
-static CK_RV aes_wrap_with_padding(
-        const unsigned char *wrapping_key,
-        size_t wrapping_key_len,
-        const CK_BYTE_PTR plaintext,
-        CK_ULONG plaintext_len,
-        CK_BYTE_PTR *wrapped_output,
-        CK_ULONG *wrapped_output_len) {
-    CK_RV rv = CKR_FUNCTION_FAILED;
-    EVP_CIPHER_CTX *ctx = NULL;
-    unsigned char *ciphertext = NULL;
-    int update_len = 0;
-    int final_len = 0;
-    int total_len = 0;
-    const EVP_CIPHER *cipher = NULL;
-
-    if (wrapping_key == NULL || plaintext == NULL || wrapped_output == NULL || wrapped_output_len == NULL) {
-        return CKR_ARGUMENTS_BAD;
-    }
-
-    switch (wrapping_key_len) {
-        case 16:
-            cipher = EVP_aes_128_wrap_pad();
-            break;
-        case 24:
-            cipher = EVP_aes_192_wrap_pad();
-            break;
-        case 32:
-            cipher = EVP_aes_256_wrap_pad();
-            break;
-        default:
-            fprintf(stderr, "Unsupported AES key length for key wrap: %zu bytes\n", wrapping_key_len);
-            return CKR_KEY_SIZE_RANGE;
-    }
-
-    ciphertext = malloc((size_t) plaintext_len + 16);
-    if (ciphertext == NULL) {
-        return CKR_HOST_MEMORY;
-    }
-
-    ctx = EVP_CIPHER_CTX_new();
-    if (ctx == NULL) {
-        rv = CKR_HOST_MEMORY;
-        goto done;
-    }
-
-    EVP_CIPHER_CTX_set_flags(ctx, EVP_CIPHER_CTX_FLAG_WRAP_ALLOW);
-    if (EVP_EncryptInit_ex(ctx, cipher, NULL, wrapping_key, NULL) != 1) {
-        goto done;
-    }
-
-    if (EVP_EncryptUpdate(ctx, ciphertext, &update_len, plaintext, (int) plaintext_len) != 1) {
-        goto done;
-    }
-
-    if (EVP_EncryptFinal_ex(ctx, ciphertext + update_len, &final_len) != 1) {
-        goto done;
-    }
-
-    total_len = update_len + final_len;
-    *wrapped_output = ciphertext;
-    *wrapped_output_len = (CK_ULONG) total_len;
-    ciphertext = NULL;
-    rv = CKR_OK;
-
-done:
-    free(ciphertext);
-    EVP_CIPHER_CTX_free(ctx);
-    return rv;
-}
-
 static CK_RV rsa_oaep_wrap_buffer(
         EVP_PKEY *public_key,
         const unsigned char *plaintext,
@@ -561,23 +493,116 @@ done:
     return rv;
 }
 
-static CK_RV build_rsa_aes_wrapped_blob(
+static CK_RV aes_gcm_wrap_buffer(
+        const unsigned char *wrapping_key,
+        size_t wrapping_key_len,
+        const CK_BYTE_PTR plaintext,
+        CK_ULONG plaintext_len,
+        CK_BYTE_PTR iv_output,
+        CK_ULONG iv_output_len,
+        CK_BYTE_PTR *wrapped_output,
+        CK_ULONG *wrapped_output_len) {
+    CK_RV rv = CKR_FUNCTION_FAILED;
+    EVP_CIPHER_CTX *ctx = NULL;
+    unsigned char *ciphertext = NULL;
+    int ciphertext_len = 0;
+    int final_len = 0;
+    const EVP_CIPHER *cipher = NULL;
+
+    if (wrapping_key == NULL || plaintext == NULL || iv_output == NULL || wrapped_output == NULL || wrapped_output_len == NULL) {
+        return CKR_ARGUMENTS_BAD;
+    }
+
+    if (iv_output_len != AES_GCM_IV_LEN_BYTES) {
+        return CKR_ARGUMENTS_BAD;
+    }
+
+    switch (wrapping_key_len) {
+        case 16:
+            cipher = EVP_aes_128_gcm();
+            break;
+        case 24:
+            cipher = EVP_aes_192_gcm();
+            break;
+        case 32:
+            cipher = EVP_aes_256_gcm();
+            break;
+        default:
+            fprintf(stderr, "Unsupported AES key length for AES-GCM: %zu bytes\n", wrapping_key_len);
+            return CKR_KEY_SIZE_RANGE;
+    }
+
+    if (RAND_bytes(iv_output, (int) iv_output_len) != 1) {
+        return CKR_FUNCTION_FAILED;
+    }
+
+    ciphertext = malloc((size_t) plaintext_len + AES_GCM_TAG_LEN_BYTES);
+    if (ciphertext == NULL) {
+        return CKR_HOST_MEMORY;
+    }
+
+    ctx = EVP_CIPHER_CTX_new();
+    if (ctx == NULL) {
+        rv = CKR_HOST_MEMORY;
+        goto done;
+    }
+
+    if (EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL) != 1) {
+        goto done;
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, (int) iv_output_len, NULL) != 1) {
+        goto done;
+    }
+    if (EVP_EncryptInit_ex(ctx, NULL, NULL, wrapping_key, iv_output) != 1) {
+        goto done;
+    }
+    if (EVP_EncryptUpdate(ctx, ciphertext, &ciphertext_len, plaintext, (int) plaintext_len) != 1) {
+        goto done;
+    }
+    if (EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &final_len) != 1) {
+        goto done;
+    }
+    ciphertext_len += final_len;
+    if (EVP_CIPHER_CTX_ctrl(ctx,
+                            EVP_CTRL_GCM_GET_TAG,
+                            AES_GCM_TAG_LEN_BYTES,
+                            ciphertext + ciphertext_len) != 1) {
+        goto done;
+    }
+    ciphertext_len += AES_GCM_TAG_LEN_BYTES;
+
+    *wrapped_output = ciphertext;
+    *wrapped_output_len = (CK_ULONG) ciphertext_len;
+    ciphertext = NULL;
+    rv = CKR_OK;
+
+done:
+    free(ciphertext);
+    EVP_CIPHER_CTX_free(ctx);
+    return rv;
+}
+
+static CK_RV build_split_wrapped_material(
         EVP_PKEY *rsa_public_key,
         CK_ULONG aes_key_bits,
         const CK_BYTE_PTR key_bytes,
         CK_ULONG key_bytes_len,
-        CK_BYTE_PTR *wrapped_output,
-        CK_ULONG *wrapped_output_len) {
+        CK_BYTE_PTR *rsa_wrapped_aes_key,
+        CK_ULONG *rsa_wrapped_aes_key_len,
+        CK_BYTE_PTR iv_output,
+        CK_ULONG iv_output_len,
+        CK_BYTE_PTR *aes_gcm_wrapped_key,
+        CK_ULONG *aes_gcm_wrapped_key_len) {
     CK_RV rv = CKR_FUNCTION_FAILED;
-    CK_BYTE_PTR rsa_wrapped_aes_key = NULL;
-    CK_BYTE_PTR aes_wrapped_key = NULL;
-    CK_BYTE_PTR combined_wrapped_key = NULL;
-    CK_ULONG rsa_wrapped_aes_key_len = 0;
-    CK_ULONG aes_wrapped_key_len = 0;
     unsigned char aes_key[32];
     size_t aes_key_len = aes_key_bits / 8;
 
-    if (aes_key_len > sizeof(aes_key) || wrapped_output == NULL || wrapped_output_len == NULL) {
+    if (aes_key_len > sizeof(aes_key) ||
+        rsa_wrapped_aes_key == NULL ||
+        rsa_wrapped_aes_key_len == NULL ||
+        iv_output == NULL ||
+        aes_gcm_wrapped_key == NULL ||
+        aes_gcm_wrapped_key_len == NULL) {
         return CKR_ARGUMENTS_BAD;
     }
 
@@ -585,37 +610,27 @@ static CK_RV build_rsa_aes_wrapped_blob(
         return CKR_FUNCTION_FAILED;
     }
 
-    rv = rsa_oaep_wrap_buffer(rsa_public_key, aes_key, aes_key_len, &rsa_wrapped_aes_key, &rsa_wrapped_aes_key_len);
+    rv = rsa_oaep_wrap_buffer(rsa_public_key, aes_key, aes_key_len, rsa_wrapped_aes_key, rsa_wrapped_aes_key_len);
     if (rv != CKR_OK) {
-        fprintf(stderr, "RSA OAEP wrapping of the ephemeral AES key failed: %lu\n", rv);
+        fprintf(stderr, "RSA OAEP wrapping of the temporary AES key failed: %lu\n", rv);
         goto done;
     }
 
-    rv = aes_wrap_with_padding(aes_key, aes_key_len, key_bytes, key_bytes_len, &aes_wrapped_key, &aes_wrapped_key_len);
+    rv = aes_gcm_wrap_buffer(aes_key,
+                             aes_key_len,
+                             key_bytes,
+                             key_bytes_len,
+                             iv_output,
+                             iv_output_len,
+                             aes_gcm_wrapped_key,
+                             aes_gcm_wrapped_key_len);
     if (rv != CKR_OK) {
-        fprintf(stderr, "AES key wrap of the EC private value failed: %lu\n", rv);
+        fprintf(stderr, "AES-GCM wrapping of the EC private key failed: %lu\n", rv);
         goto done;
     }
-
-    combined_wrapped_key = malloc((size_t) rsa_wrapped_aes_key_len + aes_wrapped_key_len);
-    if (combined_wrapped_key == NULL) {
-        rv = CKR_HOST_MEMORY;
-        goto done;
-    }
-
-    memcpy(combined_wrapped_key, rsa_wrapped_aes_key, rsa_wrapped_aes_key_len);
-    memcpy(combined_wrapped_key + rsa_wrapped_aes_key_len, aes_wrapped_key, aes_wrapped_key_len);
-
-    *wrapped_output = combined_wrapped_key;
-    *wrapped_output_len = rsa_wrapped_aes_key_len + aes_wrapped_key_len;
-    combined_wrapped_key = NULL;
-    rv = CKR_OK;
 
 done:
     OPENSSL_cleanse(aes_key, sizeof(aes_key));
-    free(rsa_wrapped_aes_key);
-    free(aes_wrapped_key);
-    free(combined_wrapped_key);
     return rv;
 }
 
@@ -628,11 +643,6 @@ static CK_RV import_ec_public_key(
     CK_BYTE key_id[] = "imported-secp256k1";
     CK_BYTE label[] = "imported-secp256k1-public";
     CK_RV rv = CKR_FUNCTION_FAILED;
-
-    /*****
-     *  - tries CKA_EC_POINT first as raw uncompressed point bytes
-     *  - falls back to DER-encoded OCTET STRING if HSM rejects the raw form
-     *****/
 
     CK_ATTRIBUTE public_template_der[] = {
             {CKA_CLASS,     &key_class,               sizeof(key_class)},
@@ -668,45 +678,80 @@ static CK_RV import_ec_public_key(
         return rv;
     }
 
-    rv = funcs->C_CreateObject(session,
-                               public_template_der,
-                               sizeof(public_template_der) / sizeof(CK_ATTRIBUTE),
-                               public_key_handle);
-    return rv;
+    return funcs->C_CreateObject(session,
+                                 public_template_der,
+                                 sizeof(public_template_der) / sizeof(CK_ATTRIBUTE),
+                                 public_key_handle);
 }
 
-static CK_RV unwrap_ec_private_key(
+static CK_RV unwrap_aes_key_with_rsa_oaep(
         CK_SESSION_HANDLE session,
-        CK_OBJECT_HANDLE unwrapping_key,
-        const struct imported_ec_material *material,
-        CK_BYTE_PTR wrapped_key,
-        CK_ULONG wrapped_key_len,
-        CK_OBJECT_HANDLE_PTR private_key_handle) {
-    CK_ULONG aes_key_bits = DEFAULT_AES_KEY_BITS;
-    CK_RSA_PKCS_OAEP_PARAMS oaep_params = {CKM_SHA256, CKG_MGF1_SHA256};
-    CK_RSA_AES_KEY_WRAP_PARAMS params = {aes_key_bits, &oaep_params};
-    CK_MECHANISM mech = {CKM_RSA_AES_KEY_WRAP, &params, sizeof(params)};
-    CK_OBJECT_CLASS key_class = CKO_PRIVATE_KEY;
-    CK_KEY_TYPE key_type = CKK_EC;
-    CK_BBOOL true_boolean = TRUE;
-    CK_BYTE key_id[] = "imported-secp256k1";
-    CK_BYTE label[] = "imported-secp256k1-private";
+        CK_OBJECT_HANDLE rsa_private_key,
+        CK_BYTE_PTR wrapped_aes_key,
+        CK_ULONG wrapped_aes_key_len,
+        CK_OBJECT_HANDLE_PTR aes_key_handle) {
+    CK_RSA_PKCS_OAEP_PARAMS params = {
+            CKM_SHA256,
+            CKG_MGF1_SHA256,
+            0,
+            NULL,
+            0
+    };
+    CK_MECHANISM mech = {CKM_RSA_PKCS_OAEP, &params, sizeof(params)};
+    CK_OBJECT_CLASS key_class = CKO_SECRET_KEY;
+    CK_KEY_TYPE key_type = CKK_AES;
 
-    CK_ATTRIBUTE private_template[] = {
-            {CKA_CLASS,       &key_class,               sizeof(key_class)},
-            {CKA_KEY_TYPE,    &key_type,                sizeof(key_type)},
-            {CKA_TOKEN,       &false_val,               sizeof(CK_BBOOL)},
-            {CKA_PRIVATE,     &true_boolean,            sizeof(CK_BBOOL)},
-            {CKA_SENSITIVE,   &true_boolean,            sizeof(CK_BBOOL)},
-            {CKA_EXTRACTABLE, &false_val,               sizeof(CK_BBOOL)},
-            {CKA_SIGN,        &true_val,                sizeof(CK_BBOOL)},
-            {CKA_ID,          key_id,                   sizeof(key_id) - 1},
-            {CKA_LABEL,       label,                    sizeof(label) - 1},
+    CK_ATTRIBUTE aes_template[] = {
+            {CKA_CLASS,       &key_class,        sizeof(key_class)},
+            {CKA_KEY_TYPE,    &key_type,         sizeof(key_type)},
+            {CKA_TOKEN,       &false_val,        sizeof(CK_BBOOL)},
+            {CKA_PRIVATE,     &true_val,         sizeof(CK_BBOOL)},
+            {CKA_SENSITIVE,   &true_val,         sizeof(CK_BBOOL)},
+            {CKA_EXTRACTABLE, &false_val,        sizeof(CK_BBOOL)},
+            {CKA_DECRYPT,     &true_val,         sizeof(CK_BBOOL)},
+            {CKA_UNWRAP,      &true_val,         sizeof(CK_BBOOL)},
     };
 
     return funcs->C_UnwrapKey(session,
                               &mech,
-                              unwrapping_key,
+                              rsa_private_key,
+                              wrapped_aes_key,
+                              wrapped_aes_key_len,
+                              aes_template,
+                              sizeof(aes_template) / sizeof(CK_ATTRIBUTE),
+                              aes_key_handle);
+}
+
+static CK_RV unwrap_ec_private_key_with_aes_gcm(
+        CK_SESSION_HANDLE session,
+        CK_OBJECT_HANDLE aes_unwrapping_key,
+        CK_BYTE_PTR wrapped_key,
+        CK_ULONG wrapped_key_len,
+        CK_BYTE_PTR iv,
+        CK_ULONG iv_len,
+        CK_OBJECT_HANDLE_PTR private_key_handle) {
+    CK_GCM_PARAMS gcm_params = {iv, iv_len, 0, NULL, 0, AES_GCM_TAG_LEN_BYTES * 8};
+    CK_MECHANISM mech = {CKM_AES_GCM, &gcm_params, sizeof(gcm_params)};
+    CK_OBJECT_CLASS key_class = CKO_PRIVATE_KEY;
+    CK_KEY_TYPE key_type = CKK_EC;
+    CK_BYTE key_id[] = "imported-secp256k1";
+    CK_BYTE label[] = "imported-secp256k1-private";
+
+    CK_ATTRIBUTE private_template[] = {
+            {CKA_CLASS,       &key_class,     sizeof(key_class)},
+            {CKA_KEY_TYPE,    &key_type,      sizeof(key_type)},
+            {CKA_TOKEN,       &false_val,     sizeof(CK_BBOOL)},
+            {CKA_PRIVATE,     &true_val,      sizeof(CK_BBOOL)},
+            {CKA_SENSITIVE,   &true_val,      sizeof(CK_BBOOL)},
+            {CKA_EXTRACTABLE, &false_val,     sizeof(CK_BBOOL)},
+            {CKA_SIGN,        &true_val,      sizeof(CK_BBOOL)},
+            {CKA_ID,          key_id,         sizeof(key_id) - 1},
+            {CKA_LABEL,       label,          sizeof(label) - 1},
+    };
+
+    return funcs->C_UnwrapKey(session,
+                              &mech,
+                              aes_unwrapping_key,
                               wrapped_key,
                               wrapped_key_len,
                               private_template,
@@ -825,8 +870,12 @@ int main(int argc, char **argv) {
     CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE rsa_public_key = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE rsa_private_key = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE temporary_aes_key = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE imported_public_key = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE imported_private_key = CK_INVALID_HANDLE;
+    CK_BYTE_PTR wrapped_aes_key = NULL;
+    CK_ULONG wrapped_aes_key_len = 0;
+    CK_BYTE aes_gcm_iv[AES_GCM_IV_LEN_BYTES] = {0};
     CK_BYTE_PTR wrapped_private_key = NULL;
     CK_ULONG wrapped_private_key_len = 0;
     CK_BYTE signature[MAX_SIGNATURE_LENGTH];
@@ -875,26 +924,44 @@ int main(int argc, char **argv) {
         goto done;
     }
 
-    rv = build_rsa_aes_wrapped_blob(rsa_wrapping_public_key,
-                                    DEFAULT_AES_KEY_BITS,
-                                    material.private_key_der,
-                                    material.private_key_der_len,
-                                    &wrapped_private_key,
-                                    &wrapped_private_key_len);
+    rv = build_split_wrapped_material(rsa_wrapping_public_key,
+                                      DEFAULT_AES_KEY_BITS,
+                                      material.private_key_der,
+                                      material.private_key_der_len,
+                                      &wrapped_aes_key,
+                                      &wrapped_aes_key_len,
+                                      aes_gcm_iv,
+                                      sizeof(aes_gcm_iv),
+                                      &wrapped_private_key,
+                                      &wrapped_private_key_len);
     if (rv != CKR_OK) {
         goto done;
     }
-    printf("Wrapped PKCS#8 EC private key with CKM_RSA_AES_KEY_WRAP-compatible format (%lu bytes)\n",
+
+    printf("Built split wrapped payloads. RSA-OAEP AES key blob: %lu bytes, AES-GCM EC private key blob: %lu bytes\n",
+           wrapped_aes_key_len,
            wrapped_private_key_len);
 
-    rv = unwrap_ec_private_key(session,
-                               rsa_private_key,
-                               &material,
-                               wrapped_private_key,
-                               wrapped_private_key_len,
-                               &imported_private_key);
+    rv = unwrap_aes_key_with_rsa_oaep(session,
+                                      rsa_private_key,
+                                      wrapped_aes_key,
+                                      wrapped_aes_key_len,
+                                      &temporary_aes_key);
     if (rv != CKR_OK) {
-        fprintf(stderr, "Failed to unwrap EC private key into the HSM: %lu\n", rv);
+        fprintf(stderr, "Failed to unwrap temporary AES key into the HSM: %lu\n", rv);
+        goto done;
+    }
+    printf("Imported temporary AES unwrapping key handle: %lu\n", temporary_aes_key);
+
+    rv = unwrap_ec_private_key_with_aes_gcm(session,
+                                            temporary_aes_key,
+                                            wrapped_private_key,
+                                            wrapped_private_key_len,
+                                            aes_gcm_iv,
+                                            sizeof(aes_gcm_iv),
+                                            &imported_private_key);
+    if (rv != CKR_OK) {
+        fprintf(stderr, "Failed to unwrap EC private key into the HSM with AES-GCM: %lu\n", rv);
         goto done;
     }
     printf("Imported EC private key handle: %lu\n", imported_private_key);
@@ -972,17 +1039,19 @@ int main(int argc, char **argv) {
     rv = CKR_OK;
 
 done:
+    free(wrapped_aes_key);
     free(wrapped_private_key);
     free(der_signature);
     EVP_PKEY_free(rsa_wrapping_public_key);
     free_imported_ec_material(&material);
     destroy_object_if_valid(session, imported_public_key);
     destroy_object_if_valid(session, imported_private_key);
+    destroy_object_if_valid(session, temporary_aes_key);
     destroy_object_if_valid(session, rsa_public_key);
     destroy_object_if_valid(session, rsa_private_key);
     if (session != CK_INVALID_HANDLE) {
         pkcs11_finalize_session(session);
     }
 
-    return rv == CKR_OK ? EXIT_SUCCESS : EXIT_FAILURE;
+    return (rv == CKR_OK) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
