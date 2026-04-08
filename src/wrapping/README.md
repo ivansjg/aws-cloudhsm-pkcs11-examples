@@ -19,7 +19,9 @@ openssl ecparam -name secp256k1 -genkey -noout -out ~/ec_private_key.pem
 ```
 - Build source code: 
 ```
-cd aws-cloudhsm-pkcs11-examples/build/
+cd aws-cloudhsm-pkcs11-examples/
+mkdir build
+cd build/
 cmake ..
 make
 ```
